@@ -1,0 +1,3 @@
+#!/bin/sh
+# Container-internal source-checkout launcher.
+exec /usr/bin/python3 /opt/dshpod/inside.py cli -- "$@"

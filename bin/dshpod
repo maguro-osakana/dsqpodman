@@ -1,0 +1,553 @@
+#!/usr/bin/python3
+"""Image-free rootless Podman environment. No host package installation."""
+import argparse
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE = Path(__file__).resolve().parent.parent
+ROOT = BASE / "rootfs"
+STORE = BASE / "storage"
+USER = pwd.getpwuid(os.getuid())
+CHOME = "/home/" + USER.pw_name
+NAME = "dshpod"
+INSIDE = "/opt/dshpod/inside.py"
+
+
+class Error(Exception):
+    pass
+
+
+def run(args, *, capture=False, check=True, env=None):
+    result = subprocess.run([str(a) for a in args], text=True, env=env,
+                            stdout=subprocess.PIPE if capture else None,
+                            stderr=subprocess.PIPE if capture else None)
+    if check and result.returncode:
+        detail = (result.stderr or "").strip()
+        raise Error(detail or f"command failed ({result.returncode}): {args[0]}")
+    return result
+
+
+def write_json(path, value):
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    temp.replace(path)
+
+
+def config():
+    value = json.loads((BASE / "config/dshpod.json").read_text())
+    port = value["port"]
+    if not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise Error("config port must be between 1024 and 65535")
+    if not isinstance(value["startup_timeout"], int) or value["startup_timeout"] < 1:
+        raise Error("startup_timeout must be a positive integer")
+    for key in ("node_major", "build_concurrency"):
+        if not isinstance(value[key], int) or value[key] < 1:
+            raise Error(f"{key} must be a positive integer")
+    return value
+
+
+def safe_managed():
+    for path in (ROOT, STORE):
+        if path.is_symlink() or path.resolve().parent != BASE:
+            raise Error(f"managed directory must not be a symlink: {path}")
+
+
+def home_path(value):
+    path = (Path(value).expanduser() if value else BASE / "workspace").resolve()
+    # Never expose the launcher, its storage, or an ancestor containing them.
+    if path == BASE or path in BASE.parents:
+        raise Error("--home must not contain the dshpodman installation")
+    for protected in (ROOT, STORE, BASE / "bin", BASE / "libexec", BASE / "config", BASE / "tests"):
+        if path == protected or protected in path.parents or path in protected.parents:
+            raise Error(f"--home overlaps managed files: {path}")
+    if any(c in str(path) for c in (",", "\n", "\r")):
+        raise Error("--home cannot contain commas or newlines (Podman mount syntax)")
+    return path
+
+
+def runtime_dir():
+    # Ubuntu's pasta AppArmor profile permits netns handles below /run/user/UID,
+    # but does not permit reading those handles from a user's home directory.
+    key = hashlib.sha256(str(BASE).encode()).hexdigest()[:16]
+    return Path(f"/run/user/{os.getuid()}") / ("dshpod-" + key)
+
+
+def pod_paths():
+    root = runtime_dir()
+    return (STORE / "graph-v2", root / "run", root / "tmp", root / "xdg")
+
+
+def podenv():
+    env = os.environ.copy()
+    for key in ("CONTAINER_HOST", "CONTAINER_CONNECTION", "PODMAN_USERNS",
+                "CONTAINERS_CONF_OVERRIDE", "CONTAINERS_STORAGE_CONF", "STORAGE_DRIVER",
+                "STORAGE_OPTS", "CONTAINERS_CONF_MODULES"):
+        env.pop(key, None)
+    env["CONTAINERS_CONF"] = str(BASE / "config/containers.conf")
+    env["XDG_RUNTIME_DIR"] = str(pod_paths()[3])
+    return env
+
+
+def pod(*args, capture=False, check=True):
+    graph, runroot, tmpdir, _ = pod_paths()
+    return run(["podman", "--remote=false", "--root", graph,
+                "--runroot", runroot, "--tmpdir", tmpdir,
+                "--storage-driver=vfs", *args], capture=capture, check=check, env=podenv())
+
+
+def prepare_runtime():
+    directory = runtime_dir()
+    parent = directory.parent
+    if not parent.is_dir() or parent.stat().st_uid != os.getuid():
+        raise Error(f"user runtime directory is unavailable: {parent}; use the host user's normal login session")
+    for path in (directory, directory / "run", directory / "tmp", directory / "xdg"):
+        if path.is_symlink():
+            raise Error(f"runtime directory must not be a symlink: {path}")
+        path.mkdir(exist_ok=True, mode=0o700)
+        if path.stat().st_uid != os.getuid():
+            raise Error(f"runtime directory has a different owner: {path}")
+        os.chmod(path, 0o700)
+
+
+def prepare_store():
+    safe_managed()
+    marker = STORE / "location.json"
+    identity = {"base": str(BASE), "uid": os.getuid(), "gid": os.getgid()}
+    if marker.exists() and json.loads(marker.read_text()) != identity:
+        state = STORE / "active.json"
+        if state.exists():
+            old = json.loads(state.read_text())
+            if old.get("boot_id") == boot_id():
+                try:
+                    os.kill(old["pid"], 0)
+                except ProcessLookupError:
+                    pass
+                except (PermissionError, KeyError):
+                    raise Error("moved environment may be running; restore its path and stop it first")
+                else:
+                    raise Error("stop the container before moving this directory")
+        print("Installation path changed; recreating the private Podman state.")
+        shutil.rmtree(STORE)
+    STORE.mkdir(exist_ok=True, mode=0o700)
+    os.chmod(STORE, 0o700)
+    write_json(marker, identity)
+    prepare_runtime()
+    (STORE / "graph-v2").mkdir(exist_ok=True, mode=0o700)
+
+
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def prerequisites():
+    if os.getuid() == 0:
+        raise Error("run as the ordinary host user, without sudo")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", USER.pw_name):
+        raise Error("unsupported username")
+    for name in ("podman", "crun", "newuidmap", "newgidmap", "pasta", "catatonit"):
+        if not shutil.which(name):
+            raise Error(f"host prerequisite missing: {name}")
+    for name in ("subuid", "subgid"):
+        rows = Path("/etc/" + name).read_text().splitlines()
+        if not any(r.split(":")[0] in (USER.pw_name, str(os.getuid()))
+                   and len(r.split(":")) == 3 and int(r.split(":")[2]) >= 65536 for r in rows):
+            raise Error(f"no sufficient /etc/{name} range for {USER.pw_name}")
+
+
+def runtime_ready():
+    info = json.loads(pod("info", "--format=json", capture=True).stdout)
+    if not info["host"]["security"]["rootless"]:
+        raise Error("Podman is not rootless")
+    return info
+
+
+def state():
+    result = pod("container", "inspect", NAME, capture=True, check=False)
+    if result.returncode:
+        # Do not mistake a broken runtime/database for an absent container.
+        if "no such" in result.stderr.lower() or "does not exist" in result.stderr.lower():
+            return None
+        raise Error(result.stderr.strip())
+    return json.loads(result.stdout)[0]
+
+
+def active_home(info):
+    for mount in info.get("Mounts", []):
+        if mount["Destination"] == CHOME:
+            return Path(mount["Source"]).resolve()
+    raise Error("container home does not match current username; stop and rebuild")
+
+
+def match_home(info, home):
+    if info and info["State"]["Running"] and active_home(info) != home:
+        raise Error(f"running home is {active_home(info)}; stop it before selecting {home}")
+
+
+def identity_files():
+    etc = ROOT / "etc"
+    group_name = USER.pw_name
+    (etc / "passwd").write_text(
+        "root:x:0:0:root:/root:/bin/bash\n"
+        f"{USER.pw_name}:x:{os.getuid()}:{os.getgid()}::{CHOME}:/bin/bash\n"
+        "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n")
+    (etc / "group").write_text(
+        f"root:x:0:\n{group_name}:x:{os.getgid()}:\nnogroup:x:65534:\n")
+    (ROOT / CHOME.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    write_json(ROOT / ".identity.json", [USER.pw_name, os.getuid(), os.getgid()])
+
+
+def build_root():
+    safe_managed()
+    if ROOT.exists():
+        shutil.rmtree(ROOT)
+    for directory in ("usr", "etc/alternatives", "etc/ssl/certs", "home", "root", "tmp",
+                      "var/tmp", "run", "dev", "proc", "sys", "opt/dshpod", "mnt"):
+        (ROOT / directory).mkdir(parents=True, exist_ok=True)
+    temporary_permissions()
+    (ROOT / "var/run").symlink_to("../run")
+    for name in ("bin", "sbin", "lib", "lib64"):
+        host = Path("/" + name)
+        if host.is_symlink():
+            (ROOT / name).symlink_to(os.readlink(host))
+        elif host.exists():
+            (ROOT / name).mkdir()
+    etc = ROOT / "etc"
+    for name in ("hosts", "hostname", "resolv.conf"):
+        (etc / name).touch()
+    (etc / "nsswitch.conf").write_text("passwd: files\ngroup: files\nhosts: files dns\n")
+    (etc / "os-release").write_text(Path("/etc/os-release").read_text())
+    (etc / "ssl/openssl.cnf").write_text(
+        "openssl_conf = openssl_init\n[openssl_init]\n")
+    identity_files()
+    for name in ("inside.py", "dsh"):
+        shutil.copy2(BASE / "libexec/dshpod" / name, ROOT / "opt/dshpod" / name)
+    (ROOT / ".dshpod-rootfs").write_text("1\n")
+
+
+def temporary_permissions():
+    # Do not let the host umask become the mode of a container's copied tmpfs.
+    for name in ("tmp", "var/tmp"):
+        os.chmod(ROOT / name, 0o1777)
+
+
+def ensure_root():
+    if not (ROOT / ".dshpod-rootfs").is_file():
+        raise Error("rootfs is missing; run bin/dshpod build")
+    expected = [USER.pw_name, os.getuid(), os.getgid()]
+    if json.loads((ROOT / ".identity.json").read_text()) != expected:
+        identity_files()
+    temporary_permissions()
+    # Keep launcher improvements available without touching the selected home.
+    for name in ("inside.py", "dsh"):
+        source = BASE / "libexec/dshpod" / name
+        target = ROOT / "opt/dshpod" / name
+        if not target.exists() or source.read_bytes() != target.read_bytes():
+            shutil.copy2(source, target)
+
+
+def mounts(cfg):
+    pairs = [("/usr", "/usr"), ("/etc/alternatives", "/etc/alternatives"),
+             ("/etc/ssl/certs", "/etc/ssl/certs")]
+    for name in ("bin", "sbin", "lib", "lib64"):
+        path = Path("/" + name)
+        if path.exists() and not path.is_symlink():
+            pairs.append((str(path), str(path)))
+    for name in ("/etc/ld.so.cache", "/etc/localtime"):
+        if Path(name).exists():
+            pairs.append((str(Path(name).resolve()), name))
+    # Alternatives and local CA symlinks sometimes point outside /usr.
+    for directory in ("/etc/alternatives", "/etc/ssl/certs"):
+        for link in Path(directory).iterdir():
+            if link.is_symlink():
+                dest = link.resolve()
+                if str(dest).startswith(("/usr/", "/etc/alternatives/", "/etc/ssl/certs/")):
+                    continue
+                if dest.is_file() and str(dest).startswith(("/etc/", "/usr/local/")):
+                    pairs.append((str(dest), str(dest)))
+    for item in cfg.get("extra_ro", []):
+        source = Path(item).expanduser().resolve()
+        if not source.is_absolute() or not source.exists():
+            raise Error(f"extra_ro does not exist: {item}")
+        forbidden = (Path("/"), Path("/proc"), Path("/sys"), Path("/dev"),
+                     Path("/run"), Path("/tmp"), Path("/var"), Path("/home"),
+                     Path("/etc"), Path(CHOME))
+        if source in forbidden or BASE == source or source in BASE.parents or BASE in source.parents:
+            raise Error(f"extra_ro overlaps protected paths: {source}")
+        if source.is_socket():
+            raise Error(f"extra_ro cannot expose sockets: {source}")
+        pairs.append((str(source), str(source)))
+    result = []
+    for source, target in sorted(set(pairs)):
+        if any(c in source + target for c in (",", "\n", "\r")):
+            raise Error(f"unsupported mount path: {source}")
+        point = ROOT / target.lstrip("/")
+        point.parent.mkdir(parents=True, exist_ok=True)
+        if not point.exists():
+            if Path(source).is_dir():
+                point.mkdir()
+            else:
+                point.touch()
+        result += ["--mount", f"type=bind,src={source},dst={target},ro,bind-nonrecursive"]
+    return result
+
+
+def run_args(home, cfg):
+    return ["--rootfs", "--read-only", "--read-only-tmpfs=true", "--userns=keep-id",
+            "--tmpfs=/tmp:rw,exec,nosuid,nodev,mode=1777,notmpcopyup",
+            "--tmpfs=/var/tmp:rw,exec,nosuid,nodev,mode=1777,notmpcopyup",
+            f"--user={os.getuid()}:{os.getgid()}", "--passwd=false", "--cap-drop=ALL",
+            "--security-opt=no-new-privileges", "--cgroups=disabled", "--init",
+            "--init-path=" + shutil.which("catatonit"), "--network=pasta",
+            "--hosts-file=none", "--hostname=dshpod", "--http-proxy=false",
+            "--workdir=" + CHOME, "--env=HOME=" + CHOME,
+            "--env=USER=" + USER.pw_name, "--env=LOGNAME=" + USER.pw_name,
+            "--env=LANG=C.UTF-8", "--env=PYTHONDONTWRITEBYTECODE=1",
+            "--env=DSHPOD_IN_CONTAINER=1",
+            "--mount", f"type=bind,src={home},dst={CHOME},rw,bind-nonrecursive",
+            *mounts(cfg)]
+
+
+def inside_exec(info, command, *, terminal=False):
+    flags = ["-i"] if terminal else []
+    if terminal and sys.stdin.isatty() and sys.stdout.isatty():
+        flags.append("-t")
+    return pod("exec", *flags, NAME, "/usr/bin/python3", INSIDE, *command, check=False).returncode
+
+
+def once(home, cfg, command, *, terminal=False):
+    home.mkdir(parents=True, exist_ok=True)
+    flags = ["-i"] if terminal else []
+    if terminal and sys.stdin.isatty() and sys.stdout.isatty():
+        flags.append("-t")
+    return pod("run", "--rm", *flags, *run_args(home, cfg), ROOT,
+               "/usr/bin/python3", INSIDE, *command, check=False).returncode
+
+
+def lan_ip(cfg):
+    value = cfg["lan_ip"]
+    if value == "auto":
+        result = run(["ip", "-j", "route", "get", "1.1.1.1"], capture=True)
+        routes = json.loads(result.stdout)
+        value = routes[0].get("prefsrc", routes[0].get("src")) if routes else None
+    try:
+        address = ipaddress.IPv4Address(value)
+    except (ValueError, TypeError):
+        raise Error("set lan_ip to this host's LAN IPv4 address in config/dshpod.json")
+    if address.is_loopback or address.is_unspecified or address.is_multicast:
+        raise Error("lan_ip must be a concrete non-loopback LAN IPv4 address")
+    addresses = json.loads(run(["ip", "-j", "-4", "addr"], capture=True).stdout)
+    if str(address) not in {a["local"] for i in addresses for a in i.get("addr_info", [])}:
+        raise Error(f"LAN address is not assigned to this host: {address}")
+    return str(address)
+
+
+def web_ready(url):
+    # Do not send LAN probes through a host HTTP proxy or consume the login token.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=2) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as exc:
+        return exc.code in (200, 302, 401, 403)
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def logs_url():
+    logs = pod("logs", NAME, capture=True, check=False)
+    matches = re.findall(r"https?://[^\s\x1b<>\"']+", logs.stdout + logs.stderr)
+    return next((url.rstrip(".,)") for url in reversed(matches) if "token=" in url), None)
+
+
+def start(home, cfg, info):
+    match_home(info, home)
+    if info and info["State"]["Running"]:
+        ports = info.get("NetworkSettings", {}).get("Ports", {}).get("3080/tcp") or []
+        if not ports:
+            raise Error("running container has no published Web port; stop and start it")
+        port = ports[0]
+        return wait_web(f"http://{port['HostIp']}:{port['HostPort']}/", cfg)
+    if not (home / ".local/share/dshpod/current/.dshpod-release.json").is_file():
+        raise Error(f"dsh is not installed; run bin/dshpod dshupdate --home {home}")
+    host = lan_ip(cfg)
+    if info:
+        pod("rm", NAME)
+    authority = f"{host}:{cfg['port']}"
+    url = f"http://{authority}/"
+    pod("run", "-d", "--name", NAME, "--log-driver=k8s-file",
+        "--publish", f"{host}:{cfg['port']}:3080", *run_args(home, cfg), ROOT,
+        "/usr/bin/python3", INSIDE, "serve", "--public-url", url,
+        "--trusted-host", authority, capture=True)
+    inspected = state()
+    write_json(STORE / "active.json", {"pid": inspected["State"]["Pid"], "boot_id": boot_id(),
+                                       "home": str(home)})
+    return wait_web(url, cfg)
+
+
+def wait_web(url, cfg):
+    deadline = time.monotonic() + cfg["startup_timeout"]
+    while time.monotonic() < deadline:
+        token_url = logs_url()
+        if token_url and web_ready(url):
+            print("Web UI: " + token_url)
+            return 0
+        current = state()
+        if not current or not current["State"]["Running"]:
+            pod("logs", NAME, check=False)
+            raise Error("dsh exited during startup")
+        time.sleep(0.5)
+    raise Error("Web UI startup timed out; inspect bin/dshpod status and storage logs")
+
+
+def stop(info):
+    if info:
+        if info["State"]["Running"]:
+            pod("stop", "--time=20", NAME)
+        pod("rm", NAME)
+    (STORE / "active.json").unlink(missing_ok=True)
+
+
+def check(home, cfg, info):
+    print(f"user: {USER.pw_name} uid={os.getuid()} gid={os.getgid()} home={CHOME}")
+    print(f"host home: {home}")
+    info_host = runtime_ready()
+    print(f"Podman: {info_host['version']['Version']} rootless=true")
+    if not home.is_dir():
+        raise Error("selected home does not exist; run dshupdate --home DIR")
+    running = info and info["State"]["Running"]
+    command = ["check"]
+    if running:
+        code = inside_exec(info, command)
+        # Verify persistent host binds as configured by the running container.
+        writable = [m["Destination"] for m in info.get("Mounts", [])
+                    if m.get("Type") == "bind" and m.get("RW")]
+        if writable != [CHOME]:
+            raise Error(f"unexpected writable host binds: {writable}")
+        if not info["HostConfig"]["ReadonlyRootfs"]:
+            raise Error("container rootfs is writable")
+        ports = info.get("NetworkSettings", {}).get("Ports", {}).get("3080/tcp") or []
+        if not ports or not web_ready(f"http://{ports[0]['HostIp']}:{ports[0]['HostPort']}/"):
+            raise Error("published Web UI does not respond")
+        print("Web UI: responds")
+    else:
+        code = once(home, cfg, command)
+    return code
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+    for name in ("build", "stop", "status", "logs"):
+        sub.add_parser(name)
+    for name in ("start", "shell", "exec", "dshupdate", "check"):
+        command = sub.add_parser(name)
+        command.add_argument("--home", metavar="DIR")
+        if name == "exec":
+            command.add_argument("argv", nargs=argparse.REMAINDER)
+    return result
+
+
+def main():
+    args = parser().parse_args()
+    if args.command == "exec":
+        if args.argv[:1] == ["--"]:
+            args.argv = args.argv[1:]
+        if not args.argv:
+            raise Error("exec requires a command after --")
+    cfg = config()
+    safe_managed()
+    home = home_path(getattr(args, "home", None))
+    # A separate lock survives rootfs/storage reconstruction.
+    with (BASE / "config/.dshpod.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        prerequisites()
+        prepare_store()
+        if args.command == "logs":
+            info = state()
+            if not info:
+                raise Error("no container logs available; run bin/dshpod start")
+            # Following logs must not prevent stop/start from taking the lock.
+            # Pin the ID so a replacement with the same name cannot change target.
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return pod("logs", "--follow", "--tail=-1", info["Id"], check=False).returncode
+        if args.command == "build":
+            # Even a restricted caller can prepare a fresh rootfs. Never rebuild
+            # an existing one until we can inspect and stop its containers.
+            fresh = not (ROOT / ".dshpod-rootfs").exists()
+            if fresh:
+                build_root()
+                mounts(cfg)
+                (BASE / "workspace").mkdir(exist_ok=True)
+                print("Minimal rootfs created. Checking the Podman runtime.", flush=True)
+            runtime_ready()
+            current = state()
+            stop(current)
+            if not fresh:
+                build_root()
+                mounts(cfg)
+            print("Rootfs built. Install dsh with: bin/dshpod dshupdate [--home DIR]")
+            return 0
+        ensure_root()
+        info = state()
+        if args.command == "stop":
+            stop(info)
+            print("Stopped.")
+            return 0
+        if args.command == "status":
+            if not info:
+                print("stopped (no container)")
+            else:
+                print("state: " + info["State"]["Status"])
+                print("home: " + str(active_home(info)))
+                record = active_home(info) / ".local/share/dshpod/current/.dshpod-release.json"
+                if record.exists():
+                    release = json.loads(record.read_text())
+                    print(f"dsh: {release['version']} commit={release['commit']}")
+                if info["State"]["Running"]:
+                    token_url = logs_url()
+                    if token_url:
+                        print("Web UI: " + token_url)
+            return 0
+        match_home(info, home)
+        running = info and info["State"]["Running"]
+        if args.command == "start":
+            return start(home, cfg, info)
+        if args.command == "check":
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return check(home, cfg, info)
+        if args.command == "dshupdate":
+            update_args = ["update", "--repository", cfg["repository"],
+                           "--node-major", str(cfg["node_major"]),
+                           "--concurrency", str(cfg["build_concurrency"])]
+            code = once(home, cfg, update_args)
+            if code == 0 and running:
+                stop(info)
+                return start(home, cfg, None)
+            return code
+        command = ["shell"] if args.command == "shell" else ["exec", *args.argv]
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        if running:
+            return inside_exec(info, command, terminal=True)
+        return once(home, cfg, command, terminal=True)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (Error, OSError, ValueError, KeyError) as exc:
+        print(f"dshpod: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
