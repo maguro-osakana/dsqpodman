@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Image-free rootless Podman environment. No host package installation."""
 import argparse
+import errno
 import fcntl
 import hashlib
 import ipaddress
@@ -10,10 +11,12 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = Path(__file__).resolve().parent.parent
@@ -353,6 +356,41 @@ def lan_ip(cfg):
     return str(address)
 
 
+def available_port(host, first):
+    last = min(first + 10, 65535)
+    for port in range(first, last + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((host, port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                continue
+            raise Error(f"cannot check Web port {host}:{port}: {exc}") from exc
+        return port
+    raise Error(f"no available Web port on {host} between {first} and {last}")
+
+
+def published_web_url(info):
+    ports = info.get("NetworkSettings", {}).get("Ports", {}).get("3080/tcp") or []
+    if not ports:
+        raise Error("container has no published Web port; stop and start it")
+    return f"http://{ports[0]['HostIp']}:{ports[0]['HostPort']}/"
+
+
+def validate_web_url(token_url, url):
+    try:
+        actual = urllib.parse.urlsplit(token_url)
+        expected = urllib.parse.urlsplit(url)
+        matches = ((actual.scheme, actual.hostname, actual.port) ==
+                   (expected.scheme, expected.hostname, expected.port)
+                   and actual.username is None and actual.password is None)
+    except ValueError:
+        matches = False
+    if not matches:
+        # Do not include the authentication token in the error message.
+        raise Error(f"dsh Web URL does not match published address {url}; stop and start the container")
+
+
 def web_ready(url):
     # Do not send LAN probes through a host HTTP proxy or consume the login token.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -374,20 +412,17 @@ def logs_url():
 def start(home, cfg, info):
     match_home(info, home)
     if info and info["State"]["Running"]:
-        ports = info.get("NetworkSettings", {}).get("Ports", {}).get("3080/tcp") or []
-        if not ports:
-            raise Error("running container has no published Web port; stop and start it")
-        port = ports[0]
-        return wait_web(f"http://{port['HostIp']}:{port['HostPort']}/", cfg)
+        return wait_web(published_web_url(info), cfg)
     if not (home / ".local/share/dshpod/current/.dshpod-release.json").is_file():
         raise Error(f"dsh is not installed; run bin/dshpod dshupdate --home {home}")
     host = lan_ip(cfg)
     if info:
         pod("rm", NAME)
-    authority = f"{host}:{cfg['port']}"
+    port = available_port(host, cfg["port"])
+    authority = f"{host}:{port}"
     url = f"http://{authority}/"
     pod("run", "-d", "--name", NAME, "--log-driver=k8s-file",
-        "--publish", f"{host}:{cfg['port']}:3080", *run_args(home, cfg), ROOT,
+        "--publish", f"{host}:{port}:3080", *run_args(home, cfg), ROOT,
         "/usr/bin/python3", INSIDE, "serve", "--public-url", url,
         "--trusted-host", authority, capture=True)
     inspected = state()
@@ -399,14 +434,18 @@ def start(home, cfg, info):
 def wait_web(url, cfg):
     deadline = time.monotonic() + cfg["startup_timeout"]
     while time.monotonic() < deadline:
-        token_url = logs_url()
-        if token_url and web_ready(url):
-            print("Web UI: " + token_url)
-            return 0
         current = state()
         if not current or not current["State"]["Running"]:
             pod("logs", NAME, check=False)
             raise Error("dsh exited during startup")
+        if published_web_url(current) != url:
+            raise Error(f"container Web port does not match expected address {url}; stop and start the container")
+        token_url = logs_url()
+        if token_url:
+            validate_web_url(token_url, url)
+            if web_ready(url):
+                print("Web UI: " + token_url)
+                return 0
         time.sleep(0.5)
     raise Error("Web UI startup timed out; inspect bin/dshpod status and storage logs")
 
@@ -437,8 +476,7 @@ def check(home, cfg, info):
             raise Error(f"unexpected writable host binds: {writable}")
         if not info["HostConfig"]["ReadonlyRootfs"]:
             raise Error("container rootfs is writable")
-        ports = info.get("NetworkSettings", {}).get("Ports", {}).get("3080/tcp") or []
-        if not ports or not web_ready(f"http://{ports[0]['HostIp']}:{ports[0]['HostPort']}/"):
+        if not web_ready(published_web_url(info)):
             raise Error("published Web UI does not respond")
         print("Web UI: responds")
     else:
@@ -518,6 +556,7 @@ def main():
                 if info["State"]["Running"]:
                     token_url = logs_url()
                     if token_url:
+                        validate_web_url(token_url, published_web_url(info))
                         print("Web UI: " + token_url)
             return 0
         match_home(info, home)

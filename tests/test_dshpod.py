@@ -1,6 +1,8 @@
 import importlib.machinery
 import importlib.util
+import errno
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -151,6 +153,161 @@ class ControllerTests(unittest.TestCase):
             code = self.m.inside_exec({}, ["exec", *arguments])
         self.assertEqual(code, 17)
         self.assertEqual(list(calls[0][-len(arguments):]), arguments)
+
+    def web_info(self, port=3081, running=True):
+        return {
+            "State": {"Running": running, "Status": "running" if running else "exited", "Pid": 123},
+            "NetworkSettings": {"Ports": {"3080/tcp": [
+                {"HostIp": "192.0.2.10", "HostPort": str(port)}]}},
+            "Mounts": [{"Destination": self.m.CHOME, "Source": str(self.base / "workspace")}],
+        }
+
+    def installed_web_home(self):
+        home = self.base / "workspace"
+        record = home / ".local/share/dshpod/current/.dshpod-release.json"
+        record.parent.mkdir(parents=True)
+        record.write_text("{}")
+        self.m.STORE.mkdir()
+        return home
+
+    def test_port_search_skips_busy_ports_on_selected_address(self):
+        with patch.object(self.m.socket, "socket") as socket_factory:
+            probe = socket_factory.return_value.__enter__.return_value
+            probe.bind.side_effect = [OSError(errno.EADDRINUSE, "busy"),
+                                      OSError(errno.EADDRINUSE, "busy"), None]
+            self.assertEqual(self.m.available_port("192.0.2.10", 3080), 3082)
+        self.assertEqual([call.args[0] for call in probe.bind.call_args_list],
+                         [("192.0.2.10", 3080), ("192.0.2.10", 3081), ("192.0.2.10", 3082)])
+
+    def test_port_search_does_not_skip_other_errors(self):
+        for error in (errno.EACCES, errno.EADDRNOTAVAIL):
+            with self.subTest(error=error), patch.object(self.m.socket, "socket") as socket_factory:
+                probe = socket_factory.return_value.__enter__.return_value
+                probe.bind.side_effect = OSError(error, "cannot bind")
+                with self.assertRaisesRegex(self.m.Error, "cannot check Web port"):
+                    self.m.available_port("192.0.2.10", 3080)
+                self.assertEqual(probe.bind.call_count, 1)
+
+    def test_port_search_accepts_start_plus_10(self):
+        with patch.object(self.m.socket, "socket") as socket_factory:
+            probe = socket_factory.return_value.__enter__.return_value
+            probe.bind.side_effect = [OSError(errno.EADDRINUSE, "busy")] * 10 + [None]
+            self.assertEqual(self.m.available_port("192.0.2.10", 3080), 3090)
+        self.assertEqual([call.args[0] for call in probe.bind.call_args_list],
+                         [("192.0.2.10", port) for port in range(3080, 3091)])
+
+    def test_port_search_does_not_try_start_plus_11(self):
+        with patch.object(self.m.socket, "socket") as socket_factory:
+            probe = socket_factory.return_value.__enter__.return_value
+            probe.bind.side_effect = [OSError(errno.EADDRINUSE, "busy")] * 11 + [None]
+            with self.assertRaisesRegex(self.m.Error, "between 3080 and 3090"):
+                self.m.available_port("192.0.2.10", 3080)
+        self.assertEqual([call.args[0] for call in probe.bind.call_args_list],
+                         [("192.0.2.10", port) for port in range(3080, 3091)])
+
+    def test_port_search_stops_at_65535(self):
+        with patch.object(self.m.socket, "socket") as socket_factory:
+            probe = socket_factory.return_value.__enter__.return_value
+            probe.bind.side_effect = OSError(errno.EADDRINUSE, "busy")
+            with self.assertRaisesRegex(self.m.Error, "no available Web port"):
+                self.m.available_port("192.0.2.10", 65530)
+        self.assertEqual([call.args[0] for call in probe.bind.call_args_list],
+                         [("192.0.2.10", port) for port in range(65530, 65536)])
+
+    def test_start_uses_selected_port_for_mapping_and_public_urls(self):
+        home = self.installed_web_home()
+        cfg = self.m.config()
+        original_config = (self.base / "config/dshpod.json").read_bytes()
+        with patch.object(self.m, "lan_ip", return_value="192.0.2.10"), \
+             patch.object(self.m, "available_port", return_value=3082) as select_port, \
+             patch.object(self.m, "run_args", return_value=[]), \
+             patch.object(self.m, "pod") as pod, \
+             patch.object(self.m, "state", return_value=self.web_info(3082)), \
+             patch.object(self.m, "wait_web", return_value=0) as wait_web:
+            self.assertEqual(self.m.start(home, cfg, None), 0)
+        select_port.assert_called_once_with("192.0.2.10", 3080)
+        args = pod.call_args.args
+        self.assertEqual(args[args.index("--publish") + 1], "192.0.2.10:3082:3080")
+        self.assertEqual(args[args.index("--public-url") + 1], "http://192.0.2.10:3082/")
+        self.assertEqual(args[args.index("--trusted-host") + 1], "192.0.2.10:3082")
+        wait_web.assert_called_once_with("http://192.0.2.10:3082/", cfg)
+        self.assertEqual(cfg["port"], 3080)
+        self.assertEqual((self.base / "config/dshpod.json").read_bytes(), original_config)
+
+    def test_start_keeps_existing_published_port(self):
+        cfg = self.m.config()
+        with patch.object(self.m, "available_port") as select_port, \
+             patch.object(self.m, "pod") as pod, \
+             patch.object(self.m, "wait_web", return_value=0) as wait_web:
+            self.assertEqual(self.m.start(self.base / "workspace", cfg, self.web_info(3082)), 0)
+        select_port.assert_not_called()
+        pod.assert_not_called()
+        wait_web.assert_called_once_with("http://192.0.2.10:3082/", cfg)
+
+    def test_start_does_not_retry_when_port_is_taken_after_check(self):
+        home = self.installed_web_home()
+        with patch.object(self.m, "lan_ip", return_value="192.0.2.10"), \
+             patch.object(self.m, "available_port", return_value=3081) as select_port, \
+             patch.object(self.m, "run_args", return_value=[]), \
+             patch.object(self.m, "pod", side_effect=self.m.Error("Address already in use")) as pod, \
+             patch.object(self.m, "wait_web") as wait_web:
+            with self.assertRaisesRegex(self.m.Error, "Address already in use"):
+                self.m.start(home, self.m.config(), None)
+        self.assertEqual(select_port.call_count, 1)
+        self.assertEqual(pod.call_count, 1)
+        wait_web.assert_not_called()
+        self.assertFalse((self.m.STORE / "active.json").exists())
+
+    def test_wait_web_rejects_wrong_log_url_before_http_probe(self):
+        for origin in ("http://192.0.2.10:3080/", "http://192.0.2.11:3081/",
+                       "https://192.0.2.10:3081/", "http://user@192.0.2.10:3081/",
+                       "http://192.0.2.10:invalid/"):
+            with self.subTest(origin=origin), \
+                 patch.object(self.m, "state", return_value=self.web_info()), \
+                 patch.object(self.m, "logs_url", return_value=origin + "?token=test-secret"), \
+                 patch.object(self.m, "web_ready", return_value=True) as probe:
+                with self.assertRaisesRegex(self.m.Error, "URL does not match") as error:
+                    self.m.wait_web("http://192.0.2.10:3081/", self.m.config())
+                self.assertNotIn("test-secret", str(error.exception))
+                probe.assert_not_called()
+
+    def test_wait_web_checks_actual_mapping_before_http_probe(self):
+        with patch.object(self.m, "state", return_value=self.web_info(3080)), \
+             patch.object(self.m, "logs_url", return_value="http://192.0.2.10:3081/?token=test"), \
+             patch.object(self.m, "web_ready", return_value=True) as probe:
+            with self.assertRaisesRegex(self.m.Error, "container Web port does not match"):
+                self.m.wait_web("http://192.0.2.10:3081/", self.m.config())
+        probe.assert_not_called()
+
+    def test_wait_web_checks_running_state_before_http_probe(self):
+        with patch.object(self.m, "state", return_value=self.web_info(running=False)), \
+             patch.object(self.m, "logs_url", return_value="http://192.0.2.10:3081/?token=test"), \
+             patch.object(self.m, "web_ready", return_value=True) as probe, \
+             patch.object(self.m, "pod"):
+            with self.assertRaisesRegex(self.m.Error, "dsh exited during startup"):
+                self.m.wait_web("http://192.0.2.10:3081/", self.m.config())
+        probe.assert_not_called()
+
+    def test_wait_web_reports_matching_url_without_consuming_token(self):
+        token_url = "http://192.0.2.10:3081/?token=test"
+        with patch.object(self.m, "state", return_value=self.web_info()), \
+             patch.object(self.m, "logs_url", return_value=token_url), \
+             patch.object(self.m, "web_ready", return_value=True) as probe, \
+             patch.object(self.m.sys, "stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(self.m.wait_web("http://192.0.2.10:3081/", self.m.config()), 0)
+            self.assertEqual(output.getvalue(), "Web UI: " + token_url + "\n")
+        probe.assert_called_once_with("http://192.0.2.10:3081/")
+
+    def test_status_rejects_url_that_does_not_match_actual_mapping(self):
+        with patch.object(self.m, "prerequisites"), \
+             patch.object(self.m, "ensure_root"), \
+             patch.object(self.m, "state", return_value=self.web_info(3080)), \
+             patch.object(self.m, "logs_url", return_value="http://192.0.2.10:3081/?token=test"), \
+             patch.object(self.m.sys, "argv", ["dshpod", "status"]), \
+             patch.object(self.m.sys, "stdout", new_callable=io.StringIO) as output:
+            with self.assertRaisesRegex(self.m.Error, "URL does not match"):
+                self.m.main()
+            self.assertNotIn("Web UI:", output.getvalue())
 
     def test_logs_follows_all_output_without_blocking_stop(self):
         calls = []
