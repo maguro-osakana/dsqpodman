@@ -297,9 +297,12 @@ def check():
     except RuntimeError as exc:
         errors.append(str(exc))
     try:
-        socket.getaddrinfo("github.com", 443)
-        fetch("https://nodejs.org/dist/index.json", timeout=15)
-        print("DNS / HTTPS certificates: OK", flush=True)
+        if os.environ.get("DSHPOD_NETWORK_GATE") == "1":
+            print("Network: restricted; external DNS/HTTPS probes skipped", flush=True)
+        else:
+            socket.getaddrinfo("github.com", 443)
+            fetch("https://nodejs.org/dist/index.json", timeout=15)
+            print("DNS / HTTPS certificates: OK", flush=True)
     except OSError as exc:
         errors.append(f"DNS/HTTPS: {exc}")
     try:
@@ -362,6 +365,12 @@ def main():
     if args.command == "check":
         return check()
     if args.command == "serve":
+        if os.environ.get("DSHPOD_NETWORK_GATE") == "1":
+            deadline = time.monotonic() + 60
+            while not Path("/run/dshpod-network-ready").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("network policy setup timed out; dsh was not started")
+                time.sleep(0.05)
         serve(args)
     if args.command == "cli":
         require_install()

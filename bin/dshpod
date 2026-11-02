@@ -32,8 +32,8 @@ class Error(Exception):
     pass
 
 
-def run(args, *, capture=False, check=True, env=None):
-    result = subprocess.run([str(a) for a in args], text=True, env=env,
+def run(args, *, capture=False, check=True, env=None, input=None):
+    result = subprocess.run([str(a) for a in args], text=True, env=env, input=input,
                             stdout=subprocess.PIPE if capture else None,
                             stderr=subprocess.PIPE if capture else None)
     if check and result.returncode:
@@ -103,11 +103,11 @@ def podenv():
     return env
 
 
-def pod(*args, capture=False, check=True):
+def pod(*args, capture=False, check=True, input=None):
     graph, runroot, tmpdir, _ = pod_paths()
     return run(["podman", "--remote=false", "--root", graph,
                 "--runroot", runroot, "--tmpdir", tmpdir,
-                "--storage-driver=vfs", *args], capture=capture, check=check, env=podenv())
+                "--storage-driver=vfs", *args], capture=capture, check=check, env=podenv(), input=input)
 
 
 def prepare_runtime():
@@ -409,23 +409,97 @@ def logs_url():
     return next((url.rstrip(".,)") for url in reversed(matches) if "token=" in url), None)
 
 
+NETWORK_LABEL = "io.dshpod.network"
+
+
+def network_policy(values):
+    if values is None:
+        return None
+    rules = []
+    for value in values:
+        if len(value) > 2:
+            raise Error("--restrict-network accepts at most IPv4[/mask] and PORT; repeat the option")
+        if not value:
+            continue
+        try:
+            address = str(ipaddress.IPv4Network(value[0], strict=False))
+        except ValueError:
+            raise Error("--restrict-network requires an IPv4 address or IPv4/prefix")
+        port = None
+        if len(value) == 2:
+            if not re.fullmatch(r"[0-9]+", value[1]) or not 1 <= int(value[1]) <= 65535:
+                raise Error("--restrict-network PORT must be between 1 and 65535")
+            port = int(value[1])
+        rule = [address, port]
+        if rule not in rules:
+            rules.append(rule)
+    return sorted(rules, key=lambda rule: (rule[0], rule[1] or 0))
+
+
+def active_network(info):
+    raw = (info.get("Config", {}).get("Labels") or {}).get(NETWORK_LABEL)
+    return json.loads(raw) if raw is not None else None
+
+
+def network_rules(policy):
+    # inet covers IPv4 and IPv6. Only replies to incoming connections bypass
+    # the destination whitelist; established outgoing flows still match it.
+    lines = ["table inet dshpod {", "chain output {",
+             "type filter hook output priority 0; policy drop;",
+             'oifname "lo" accept',
+             "ct direction reply ct state established accept"]
+    for address, port in policy:
+        if port is None:
+            lines.append(f"ip daddr {address} accept")
+        else:
+            lines.append(f"ip daddr {address} meta l4proto {{ tcp, udp }} th dport {port} accept")
+    return "\n".join(lines + ["}", "}", ""])
+
+
+def apply_network(info, policy):
+    pid = int(info["State"]["Pid"])
+    # Enter the owning user namespace before entering its network namespace.
+    # Mount/PID namespaces stay on the host; nft is read from the host /usr.
+    pod("unshare", "nsenter", f"--user=/proc/{pid}/ns/user",
+        f"--net=/proc/{pid}/ns/net", "--", shutil.which("nft"), "-f", "-",
+        input=network_rules(policy), capture=True)
+    pod("exec", "--user=0", NAME, "/usr/bin/python3", "-I", "-c",
+        "from pathlib import Path; Path('/run/dshpod-network-ready').touch()", capture=True)
+
+
 def start(home, cfg, info):
     match_home(info, home)
+    policy = cfg.get("restricted_network")
     if info and info["State"]["Running"]:
+        if "restricted_network" in cfg and policy != active_network(info):
+            raise Error("network policy differs from running container; stop it before starting")
         return wait_web(published_web_url(info), cfg)
     if not (home / ".local/share/dshpod/current/.dshpod-release.json").is_file():
         raise Error(f"dsh is not installed; run bin/dshpod dshupdate --home {home}")
+    if policy is not None:
+        for tool in ("nft", "nsenter"):
+            if not shutil.which(tool):
+                raise Error(f"restricted networking requires host command: {tool}")
     host = lan_ip(cfg)
     if info:
         pod("rm", NAME)
     port = available_port(host, cfg["port"])
     authority = f"{host}:{port}"
     url = f"http://{authority}/"
-    pod("run", "-d", "--name", NAME, "--log-driver=k8s-file",
+    network_args = [] if policy is None else [
+        "--label", NETWORK_LABEL + "=" + json.dumps(policy),
+        "--env=DSHPOD_NETWORK_GATE=1"]
+    pod("run", "-d", "--name", NAME, "--log-driver=k8s-file", *network_args,
         "--publish", f"{host}:{port}:3080", *run_args(home, cfg), ROOT,
-        "/usr/bin/python3", INSIDE, "serve", "--public-url", url,
+        "/usr/bin/python3", *(["-I"] if policy is not None else []), INSIDE, "serve", "--public-url", url,
         "--trusted-host", authority, capture=True)
     inspected = state()
+    if policy is not None:
+        try:
+            apply_network(inspected, policy)
+        except Exception:
+            pod("rm", "--force", NAME, check=False)
+            raise
     write_json(STORE / "active.json", {"pid": inspected["State"]["Pid"], "boot_id": boot_id(),
                                        "home": str(home)})
     return wait_web(url, cfg)
@@ -485,15 +559,108 @@ def check(home, cfg, info):
 
 
 def parser():
-    result = argparse.ArgumentParser(description=__doc__)
-    sub = result.add_subparsers(dest="command", required=True)
-    for name in ("build", "stop", "status", "logs"):
-        sub.add_parser(name)
-    for name in ("start", "shell", "exec", "dshupdate", "check"):
-        command = sub.add_parser(name)
-        command.add_argument("--home", metavar="DIR")
+    # argparse added automatic help colors in Python 3.14.
+    options = {"color": False} if sys.version_info >= (3, 14) else {}
+    options["formatter_class"] = argparse.RawDescriptionHelpFormatter
+    result = argparse.ArgumentParser(
+        description=__doc__, **options,
+        epilog="""Quick start:
+  bin/dshpod build
+  bin/dshpod dshupdate
+  bin/dshpod start
+  bin/dshpod stop
+
+Configuration: config/dshpod.json, relative to the installation directory.
+The default container home is backed by workspace/ in the installation.
+Run 'bin/dshpod COMMAND -h' for command options and examples.""")
+    sub = result.add_subparsers(dest="command", required=True, title="commands",
+                               metavar="COMMAND")
+    commands = {
+        "build": (
+            "Create or rebuild the minimal rootfs.",
+            "Stops and removes the existing container before rebuilding.\n"
+            "Preserves workspace/ and any external home directory.\n"
+            "Next, run 'bin/dshpod dshupdate' to install dsh."),
+        "stop": (
+            "Stop and remove the persistent container.",
+            "Preserves the selected home directory and installed dsh.\n"
+            "Also removes the container's logs."),
+        "status": (
+            "Show container state, home, network policy, dsh version and Web URL.",
+            "Uses the existing container's home; no --home option is needed.\n"
+            "The Web URL is shown when available for a running container."),
+        "logs": (
+            "Show all logs for the current container and follow new output.",
+            "Press Ctrl+C to stop following; the container keeps running.\n"
+            "Logs from removed containers are not retained."),
+        "start": (
+            "Start the persistent container and print the Web UI login URL.",
+            "Requires build and dshupdate first. Reuses a running container.\n"
+            "Binds the Web UI to the configured LAN IPv4 address and port;\n"
+            "tries up to 10 higher ports if the configured port is busy.\n\n"
+            "Network restrictions:\n"
+            "  Repeat --restrict-network to combine allowed destinations.\n"
+            "  With no values, deny all outgoing IPv4 and IPv6 traffic.\n"
+            "  An IPv4 address or subnet allows all ports unless PORT is given.\n"
+            "  PORT (1-65535) applies to both TCP and UDP; prefixes are 0-32.\n"
+            "  Loopback and replies to incoming connections remain allowed.\n"
+            "  DNS is not automatically allowed. Requires host nft and nsenter.\n"
+            "  Without this option, a new container has unrestricted networking;\n"
+            "  a running container keeps its existing policy. Stop before changing it.\n\n"
+            "Examples:\n"
+            "  bin/dshpod start --home /path/to/home\n"
+            "  bin/dshpod start --restrict-network\n"
+            "  bin/dshpod start --restrict-network 192.168.1.20\n"
+            "  bin/dshpod start --restrict-network 192.168.1.20 8000 "
+            "--restrict-network 10.0.0.0/24 443"),
+        "shell": (
+            "Open an interactive Bash shell in the container.",
+            "Uses the running container, or a temporary container when stopped.\n"
+            "A temporary container does not inherit start's network restrictions.\n\n"
+            "Example: bin/dshpod shell --home /path/to/home"),
+        "exec": (
+            "Run a command in the container and return its exit status.",
+            "Uses the running container, or a temporary container when stopped.\n"
+            "A temporary container does not inherit start's network restrictions.\n"
+            "Put launcher options before --. Arguments are passed directly;\n"
+            "use bash -c explicitly for pipes, redirects or shell expansion.\n\n"
+            "Examples:\n"
+            "  bin/dshpod exec -- dsh --version\n"
+            "  bin/dshpod exec --home /path/to/home -- git status\n"
+            "  bin/dshpod exec -- bash -c 'printf \"hello\\n\" | cat'"),
+        "dshupdate": (
+            "Install or update dsh and its required runtimes in the selected home.",
+            "Clones and builds the configured repository's default branch in a\n"
+            "temporary container with unrestricted networking. Requires build first.\n"
+            "On success, restarts a running container with its existing network policy.\n\n"
+            "Example: bin/dshpod dshupdate --home /path/to/home"),
+        "check": (
+            "Check the runtime, installed tools and container isolation.",
+            "Uses the running container, or a temporary container when stopped.\n"
+            "Also checks the published Web UI when running. Skips external DNS\n"
+            "and HTTPS checks in a container with restricted networking.\n\n"
+            "Example: bin/dshpod check --home /path/to/home"),
+    }
+    for name, (summary, details) in commands.items():
+        command = sub.add_parser(name, help=summary, description=summary,
+                                 epilog=details, **options)
+        if name in ("start", "shell", "exec", "dshupdate", "check"):
+            command.add_argument(
+                "--home", metavar="DIR",
+                help="host directory mounted read/write as the container home "
+                     "(default: workspace/ in the installation); relative paths "
+                     "use the current directory. Use the same home as the running "
+                     "container, or stop it before switching")
+        if name == "start":
+            command.add_argument("--restrict-network", action="append", nargs="*",
+                                 metavar="IPv4[/mask] [PORT]",
+                                 help="restrict outgoing traffic; optionally allow an IPv4 "
+                                      "address/subnet and port. Repeat for more rules; "
+                                      "use without values to deny all outgoing traffic")
         if name == "exec":
-            command.add_argument("argv", nargs=argparse.REMAINDER)
+            command.add_argument("argv", nargs=argparse.REMAINDER,
+                                 metavar="COMMAND [ARG ...]",
+                                 help="command and arguments to run after --")
     return result
 
 
@@ -505,6 +672,8 @@ def main():
         if not args.argv:
             raise Error("exec requires a command after --")
     cfg = config()
+    if args.command == "start" and args.restrict_network is not None:
+        cfg["restricted_network"] = network_policy(args.restrict_network)
     safe_managed()
     home = home_path(getattr(args, "home", None))
     # A separate lock survives rootfs/storage reconstruction.
@@ -549,6 +718,9 @@ def main():
             else:
                 print("state: " + info["State"]["Status"])
                 print("home: " + str(active_home(info)))
+                policy = active_network(info)
+                print("network: " + ("unrestricted" if policy is None else
+                                     "restricted " + json.dumps(policy)))
                 record = active_home(info) / ".local/share/dshpod/current/.dshpod-release.json"
                 if record.exists():
                     release = json.loads(record.read_text())
@@ -572,6 +744,7 @@ def main():
                            "--concurrency", str(cfg["build_concurrency"])]
             code = once(home, cfg, update_args)
             if code == 0 and running:
+                cfg["restricted_network"] = active_network(info)
                 stop(info)
                 return start(home, cfg, None)
             return code

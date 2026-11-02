@@ -35,11 +35,58 @@ class ControllerTests(unittest.TestCase):
         shutil.copytree(PROJECT / "libexec", self.base / "libexec")
         shutil.copytree(PROJECT / "config", self.base / "config",
                         ignore=shutil.ignore_patterns(".dshpod.lock"))
+        config_path = self.base / "config/dshpod.json"
+        cfg = json.loads(config_path.read_text())
+        cfg["port"] = 3080
+        config_path.write_text(json.dumps(cfg))
         self.m = module("controller", self.base / "bin/dshpod")
         self.default_runtime_dir = self.m.runtime_dir
         user_runtime = Path(self.temp.name) / "user-runtime"
         user_runtime.mkdir(mode=0o700)
         self.m.runtime_dir = lambda: user_runtime / "dshpod-test"
+
+    def test_network_options_and_validation(self):
+        args = self.m.parser().parse_args(["start", "--restrict-network",
+            "--restrict-network", "192.168.1.20", "8000",
+            "--restrict-network", "10.0.0.7/24"])
+        self.assertEqual(self.m.network_policy(args.restrict_network),
+                         [["10.0.0.0/24", None], ["192.168.1.20/32", 8000]])
+        self.assertIsNone(self.m.network_policy(None))
+        self.assertEqual(self.m.network_policy([[]]), [])
+        for values in (["::1"], ["bad"], ["10.0.0.1/33"],
+                       ["10.0.0.1", "0"], ["10.0.0.1", "65536"],
+                       ["10.0.0.1", "443", "80"], ["10.0.0.1", "x"]):
+            with self.subTest(values=values), self.assertRaises(self.m.Error):
+                self.m.network_policy([values])
+
+    def test_network_rules_cover_both_families_and_reply_direction(self):
+        rules = self.m.network_rules([["10.0.0.1/32", 443], ["10.1.0.0/16", None]])
+        self.assertIn("table inet", rules)
+        self.assertIn("policy drop", rules)
+        self.assertIn("ct direction reply ct state established accept", rules)
+        self.assertIn("meta l4proto { tcp, udp } th dport 443 accept", rules)
+        self.assertIn("ip daddr 10.1.0.0/16 accept", rules)
+
+    def test_network_failure_removes_container_without_starting_web(self):
+        home = self.installed_web_home()
+        cfg = self.m.config()
+        cfg["restricted_network"] = []
+        with patch.object(self.m, "lan_ip", return_value="192.0.2.10"), \
+             patch.object(self.m, "available_port", return_value=3080), \
+             patch.object(self.m, "run_args", return_value=[]), \
+             patch.object(self.m, "pod") as pod, \
+             patch.object(self.m, "state", return_value=self.web_info()), \
+             patch.object(self.m, "apply_network", side_effect=self.m.Error("nft failed")), \
+             patch.object(self.m, "wait_web") as wait_web:
+            with self.assertRaisesRegex(self.m.Error, "nft failed"):
+                self.m.start(home, cfg, None)
+        wait_web.assert_not_called()
+        self.assertIn("--env=DSHPOD_NETWORK_GATE=1", pod.call_args_list[0].args)
+        self.assertEqual(pod.call_args_list[-1].args, ("rm", "--force", self.m.NAME))
+
+    def test_running_container_rejects_changed_policy(self):
+        with self.assertRaisesRegex(self.m.Error, "network policy differs"):
+            self.m.start(self.base / "workspace", {"restricted_network": []}, self.web_info())
 
     def test_username_uid_gid_are_dynamic(self):
         self.m.USER = types.SimpleNamespace(pw_name="foo")
